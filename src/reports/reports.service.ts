@@ -1,6 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, SelectQueryBuilder } from 'typeorm';
+import { Repository, SelectQueryBuilder, DataSource } from 'typeorm';
 import * as ExcelJS from 'exceljs';
 import PdfPrinter from 'pdfmake';
 import type { TDocumentDefinitions, TableCell } from 'pdfmake/interfaces';
@@ -43,6 +43,8 @@ export class ReportsService {
     private readonly creditRepository: Repository<Credit>,
     @InjectRepository(Shift)
     private readonly shiftRepository: Repository<Shift>,
+    // Inyectamos DataSource para poder ejecutar consultas crudas
+    private dataSource: DataSource,
   ) { }
 
   // ==================== MÉTODOS AUXILIARES PARA GRANULARIDAD ====================
@@ -86,7 +88,6 @@ export class ReportsService {
     }
 
     if (q.paymentMethod) {
-      // ojo: campo correcto en tu entidad es method_name
       qb.leftJoin('sale.paymentMethod', 'pm')
         .andWhere('pm.method_name = :pm', { pm: q.paymentMethod });
     }
@@ -95,22 +96,17 @@ export class ReportsService {
   }
 
   private buildTimeBucket(granularity: Granularity) {
-    // Convertimos timestamp a la zona Lima y truncamos
-    if (granularity === 'week') return `date_trunc('week',  sale.sale_timestamp AT TIME ZONE '${this.tz}')`;
+    if (granularity === 'week') return `date_trunc('week', sale.sale_timestamp AT TIME ZONE '${this.tz}')`;
     if (granularity === 'month') return `date_trunc('month', sale.sale_timestamp AT TIME ZONE '${this.tz}')`;
-    // por día por defecto
-    return `date_trunc('day',   sale.sale_timestamp AT TIME ZONE '${this.tz}')`;
+    return `date_trunc('day', sale.sale_timestamp AT TIME ZONE '${this.tz}')`;
   }
 
   async getSalesAggregated(q: SalesByPeriodQueryDto) {
     const gran = q.granularity ?? 'day';
 
     if (gran === 'shift') {
-      // Método mejorado para agrupar por shift usando query builder optimizado
       const qb = this.saleRepository.createQueryBuilder('sale');
-
       this.applyFilters(qb, q);
-
       qb.select('COALESCE(sale.shift, \'Sin turno\')', 'shift_name')
         .addSelect('COUNT(*)', 'orders')
         .addSelect('SUM(sale.total_amount)', 'total')
@@ -118,8 +114,6 @@ export class ReportsService {
         .orderBy('shift_name', 'ASC');
 
       const rawResults = await qb.getRawMany();
-
-      // Transformar resultados para mantener consistencia
       return rawResults.map(row => ({
         shift_name: row.shift_name,
         orders: Number(row.orders || 0),
@@ -127,24 +121,22 @@ export class ReportsService {
       }));
     }
 
-    // Día / Semana / Mes
     const bucketExpr = this.buildTimeBucket(gran);
     const qb = this.saleRepository.createQueryBuilder('sale')
       .select(`${bucketExpr}`, 'bucket')
       .addSelect('COUNT(*)', 'orders')
       .addSelect('SUM(sale.total_amount)', 'total');
-
+      
     this.applyFilters(qb, q);
-
+    
     qb.groupBy('bucket').orderBy('bucket', 'ASC');
 
     const rows = await qb.getRawMany();
 
-    // Normaliza salida: bucket -> ISO date (día) o inicio de semana/mes
     const data = rows.map(r => ({
       bucket: r.bucket instanceof Date
         ? r.bucket.toISOString()
-        : r.bucket, // PG devuelve timestamp; Nest lo parsea a Date
+        : r.bucket,
       orders: Number(r.orders ?? 0),
       total: Number(r.total ?? 0),
     }));
@@ -206,21 +198,13 @@ export class ReportsService {
     if (employeeId) {
       queryBuilder.andWhere('employee.employee_id = :employeeId', { employeeId });
     }
-    // shiftId solo si existe en tu entity/tabla, si no, comenta o elimina esta parte
-    // if (shiftId) {
-    //   queryBuilder.andWhere('sale.shift_id = :shiftId', { shiftId });
-    // }
 
     const sales = await queryBuilder.getMany();
-
-    // Calcular métricas
     const totalSales = sales.reduce((sum, sale) => sum + parseFloat(sale.total_amount.toString()), 0);
     const totalQuantity = sales.reduce((sum, sale) =>
       sum + sale.saleDetails.reduce((detailSum, detail) => detailSum + parseFloat(detail.quantity.toString()), 0), 0
     );
     const averageTransaction = sales.length > 0 ? totalSales / sales.length : 0;
-
-    // Ventas por producto
     const salesByProduct = {};
     sales.forEach(sale => {
       sale.saleDetails.forEach(detail => {
@@ -232,8 +216,6 @@ export class ReportsService {
         salesByProduct[productName].amount += parseFloat(detail.subtotal.toString());
       });
     });
-
-    // Ventas por método de pago
     const salesByPaymentMethod = {};
     sales.forEach(sale => {
       const paymentMethodName = sale.paymentMethod?.method_name || 'Sin especificar';
@@ -242,8 +224,6 @@ export class ReportsService {
       }
       salesByPaymentMethod[paymentMethodName] += parseFloat(sale.total_amount.toString());
     });
-
-    // Datos de línea de tiempo (agrupados por día)
     const timelineData = {};
     sales.forEach(sale => {
       const date = sale.sale_timestamp.toISOString().split('T')[0];
@@ -266,6 +246,40 @@ export class ReportsService {
       salesCount: sales.length,
     };
   }
+  
+  /**
+   * Obtiene un resumen de ventas por empleado consultando directamente la vista de la base de datos.
+   * La vista ya pre-calcula los nombres completos y totales, lo que mejora la eficiencia.
+   */
+  async getSalesSummaryByEmployee() {
+    // Consulta directa a la vista de PostgreSQL
+    const rawResults = await this.dataSource.manager.query('SELECT * FROM ventas_por_empleado_view');
+    
+    const employeeSales = {};
+    const rankingData = rawResults.map(row => {
+      const employeeName = row.employee_name || 'Sin vendedor';
+      const data = {
+        employee_id: row.employee_id,
+        totalSales: Number(row.total_sales || 0),
+        salesCount: Number(row.orders_count || 0),
+        orders: Number(row.orders_count || 0),
+        total: Number(row.total_sales || 0),
+      };
+
+      employeeSales[employeeName] = data;
+
+      return {
+        name: employeeName,
+        ...data,
+      };
+    });
+
+    return {
+      employeeSales,
+      rankingData,
+      totalEmployees: Object.keys(employeeSales).length,
+    };
+  }
 
   async getSalesByEmployee(
     startDate: string,
@@ -273,13 +287,11 @@ export class ReportsService {
     employeeId?: number,
     shiftId?: number,
   ) {
-    // Método mejorado usando query builder optimizado
     const queryBuilder = this.saleRepository
       .createQueryBuilder('s')
-      .leftJoin("sales.user", "u")
-      .addSelect("u.full_name", "user_full_name")
+      .leftJoin('s.employee', 'e')
       .select('e.employee_id', 'employee_id')
-      .addSelect("concat_ws(' ', e.first_name, e.last_name)", "employee_name")
+      .addSelect("CONCAT_WS(' ', e.first_name, e.last_name)", 'employee_name')
       .addSelect('COUNT(*)', 'orders')
       .addSelect('SUM(s.total_amount)', 'total')
       .where('s.sale_timestamp::date BETWEEN :startDate::date AND :endDate::date', {
@@ -287,7 +299,7 @@ export class ReportsService {
         endDate,
       })
       .groupBy('e.employee_id')
-      .addGroupBy('e.full_name')
+      .addGroupBy('employee_name')
       .orderBy('total', 'DESC');
 
     if (employeeId) {
@@ -296,7 +308,6 @@ export class ReportsService {
 
     const rawResults = await queryBuilder.getRawMany();
 
-    // Transformar resultados para mantener compatibilidad con el formato anterior
     const employeeSales = {};
     const rankingData = rawResults.map(row => {
       const employeeName = row.employee_name || 'Sin vendedor';
@@ -323,7 +334,6 @@ export class ReportsService {
     };
   }
 
-  // Nuevo método: Ventas por Producto (top productos / mix)
   async getSalesByProduct(
     startDate: string,
     endDate: string,
@@ -337,10 +347,11 @@ export class ReportsService {
       .select('p.product_id', 'product_id')
       .addSelect('p.name', 'product_name')
       .addSelect('SUM(sd.quantity)', 'qty')
-      .addSelect('SUM(sd.quantity * sd.unit_price)', 'revenue')
+      .addSelect('SUM(sd.quantity * sd.unit_price_at_sale)', 'revenue')
+      // Corregido: Usa fechas por defecto si los parámetros están vacíos
       .where('s.sale_timestamp::date BETWEEN :startDate::date AND :endDate::date', {
-        startDate,
-        endDate,
+        startDate: startDate || '1900-01-01',
+        endDate: endDate || '2099-12-31',
       })
       .groupBy('p.product_id')
       .addGroupBy('p.name')
@@ -353,18 +364,17 @@ export class ReportsService {
     if (limit) {
       queryBuilder.limit(limit);
     } else {
-      queryBuilder.limit(10); // Límite por defecto
+      queryBuilder.limit(10);
     }
 
     const rawResults = await queryBuilder.getRawMany();
 
-    // Transformar resultados
     const productSales = rawResults.map(row => ({
       product_id: row.product_id,
       product_name: row.product_name || 'Producto sin nombre',
       quantity: Number(row.qty || 0),
       revenue: Number(row.revenue || 0),
-      qty: Number(row.qty || 0), // Mantener compatibilidad
+      qty: Number(row.qty || 0),
     }));
 
     const totalRevenue = productSales.reduce((sum, product) => sum + product.revenue, 0);
@@ -377,7 +387,6 @@ export class ReportsService {
       productsCount: productSales.length,
     };
   }
-
 
   // ==================== REPORTES DE INVENTARIO ====================
 
@@ -397,13 +406,13 @@ export class ReportsService {
 
     const stockData = tanks.map(tank => {
       const currentStock = parseFloat(tank.current_stock?.toString() || '0');
-      const capacity = parseFloat(tank.capacity?.toString() || '1');
+      const capacity = parseFloat(tank.total_capacity?.toString() || '1');
       const fillPercentage = (currentStock / capacity) * 100;
-      const isLowStock = fillPercentage < 20; // Umbral del 20%
+      const isLowStock = fillPercentage < 20;
 
       return {
         tankId: tank.tank_id,
-        tankName: tank.name,
+        tankName: tank.tank_name,
         productId: tank.product?.product_id,
         productName: tank.product?.name,
         currentStock,
@@ -423,26 +432,26 @@ export class ReportsService {
     productId?: number,
     tankId?: number,
   ) {
-    // Método mejorado usando query builder optimizado según pasted content
     const queryBuilder = this.stockMovementRepository
       .createQueryBuilder('m')
       .leftJoin('m.product', 'p')
       .leftJoin('m.tank', 't')
-      .select('m.movement_type', 'type')        // in | out | adjust
+      .select('m.movement_type', 'type')
       .addSelect('p.product_id', 'product_id')
       .addSelect('p.name', 'product_name')
       .addSelect('t.tank_id', 'tank_id')
-      .addSelect('t.name', 'tank_name')
+      .addSelect('t.tank_name', 'tank_name')
       .addSelect('SUM(m.quantity)', 'quantity')
-      .addSelect('MIN(m.created_at)', 'first_at')
-      .addSelect('MAX(m.created_at)', 'last_at')
-      .where('m.created_at::date BETWEEN :startDate::date AND :endDate::date', {
-        startDate,
-        endDate,
+      .addSelect('MIN(m.movement_timestamp)', 'first_at')
+      .addSelect('MAX(m.movement_timestamp)', 'last_at')
+      // Corregido: Usa fechas por defecto si los parámetros están vacíos
+      .where('m.movement_timestamp::date BETWEEN :startDate::date AND :endDate::date', {
+        startDate: startDate || '1900-01-01',
+        endDate: endDate || '2099-12-31',
       })
       .groupBy('m.movement_type')
       .addGroupBy('p.product_id').addGroupBy('p.name')
-      .addGroupBy('t.tank_id').addGroupBy('t.name')
+      .addGroupBy('t.tank_id').addGroupBy('t.tank_name')
       .orderBy('last_at', 'DESC');
 
     if (movementType) {
@@ -456,21 +465,15 @@ export class ReportsService {
     }
 
     const rawResults = await queryBuilder.getRawMany();
-
-    // Calcular totales optimizados
     const totalIn = rawResults
       .filter(m => m.type === 'in' || m.type === 'Entrada')
       .reduce((sum, m) => sum + Number(m.quantity || 0), 0);
-
     const totalOut = rawResults
       .filter(m => m.type === 'out' || m.type === 'Salida')
       .reduce((sum, m) => sum + Number(m.quantity || 0), 0);
-
     const netAdjustments = rawResults
       .filter(m => m.type === 'adjust' || m.type === 'Ajuste')
       .reduce((sum, m) => sum + Number(m.quantity || 0), 0);
-
-    // Transformar resultados para mantener compatibilidad
     const movementDetails = rawResults.map(row => ({
       movement_type: row.type,
       product_id: row.product_id,
@@ -491,7 +494,6 @@ export class ReportsService {
     };
   }
 
-  // Nuevo método: Variación por tanque en el tiempo (serie temporal)
   async getTankVariations(
     startDate: string,
     endDate: string,
@@ -499,12 +501,13 @@ export class ReportsService {
   ) {
     const queryBuilder = this.stockMovementRepository
       .createQueryBuilder('m')
-      .select("date_trunc('day', m.created_at AT TIME ZONE 'America/Lima')", 'bucket')
+      .select("date_trunc('day', m.movement_timestamp AT TIME ZONE 'America/Lima')", 'bucket')
       .addSelect('m.tank_id', 'tank_id')
       .addSelect('SUM(CASE WHEN m.movement_type = \'in\' OR m.movement_type = \'Entrada\' THEN m.quantity ELSE -m.quantity END)', 'net_qty')
-      .where('m.created_at::date BETWEEN :startDate::date AND :endDate::date', {
-        startDate,
-        endDate,
+      // Corregido: Usa fechas por defecto si los parámetros están vacíos
+      .where('m.movement_timestamp::date BETWEEN :startDate::date AND :endDate::date', {
+        startDate: startDate || '1900-01-01',
+        endDate: endDate || '2099-12-31',
       })
       .groupBy('bucket').addGroupBy('m.tank_id')
       .orderBy('bucket', 'ASC');
@@ -514,8 +517,6 @@ export class ReportsService {
     }
 
     const rawResults = await queryBuilder.getRawMany();
-
-    // Transformar resultados
     const variations = rawResults.map(row => ({
       date: row.bucket instanceof Date ? row.bucket.toISOString().split('T')[0] : row.bucket,
       tank_id: row.tank_id,
@@ -536,26 +537,22 @@ export class ReportsService {
     endDate: string,
     expenseCategory?: string,
   ) {
-    // Ingresos (ventas)
     const salesQuery = this.saleRepository
       .createQueryBuilder('sale')
+      // Corregido: Usa fechas por defecto si los parámetros están vacíos
       .where('sale.sale_timestamp BETWEEN :startDate AND :endDate', {
-        startDate,
-        endDate,
+        startDate: startDate || '1900-01-01',
+        endDate: endDate || '2099-12-31',
       });
 
     const sales = await salesQuery.getMany();
     const totalIncome = sales.reduce((sum, sale) => sum + parseFloat(sale.total_amount.toString()), 0);
-
-    // Para gastos, necesitarías una entidad de gastos/egresos
-    // Por ahora simularemos con datos básicos
-    const totalExpenses = 0; // Implementar cuando tengas entidad de gastos
+    const totalExpenses = 0;
     const netProfit = totalIncome - totalExpenses;
 
-    // Datos mensuales (simplificado)
     const monthlyData = {};
     sales.forEach(sale => {
-      const month = sale.sale_timestamp.toISOString().substring(0, 7); // YYYY-MM
+      const month = sale.sale_timestamp.toISOString().substring(0, 7);
       if (!monthlyData[month]) {
         monthlyData[month] = { income: 0, expenses: 0 };
       }
@@ -567,7 +564,7 @@ export class ReportsService {
       totalExpenses,
       netProfit,
       monthlyComparisonData: monthlyData,
-      expenseDistributionData: {}, // Implementar cuando tengas categorías de gastos
+      expenseDistributionData: {},
     };
   }
 
@@ -579,9 +576,10 @@ export class ReportsService {
     const queryBuilder = this.saleRepository
       .createQueryBuilder('sale')
       .leftJoinAndSelect('sale.paymentMethod', 'paymentMethod')
+      // Corregido: Usa fechas por defecto si los parámetros están vacíos
       .where('sale.sale_timestamp BETWEEN :startDate AND :endDate', {
-        startDate,
-        endDate,
+        startDate: startDate || '1900-01-01',
+        endDate: endDate || '2099-12-31',
       });
 
     if (paymentMethod) {
@@ -589,16 +587,13 @@ export class ReportsService {
     }
 
     const sales = await queryBuilder.getMany();
-
     const cashReceived = sales
       .filter(sale => sale.paymentMethod?.method_name === 'Efectivo')
       .reduce((sum, sale) => sum + parseFloat(sale.total_amount.toString()), 0);
-
     const transfersReceived = sales
       .filter(sale => sale.paymentMethod?.method_name === 'Transferencia')
       .reduce((sum, sale) => sum + parseFloat(sale.total_amount.toString()), 0);
 
-    // Flujo diario
     const dailyFlowData = {};
     sales.forEach(sale => {
       const date = sale.sale_timestamp.toISOString().split('T')[0];
@@ -611,9 +606,9 @@ export class ReportsService {
     return {
       cashReceived,
       transfersReceived,
-      creditsData: {}, // Implementar con datos de créditos
+      creditsData: {},
       dailyFlowData,
-      projectionsData: {}, // Implementar proyecciones
+      projectionsData: {},
     };
   }
 
@@ -625,27 +620,25 @@ export class ReportsService {
     dueDateStart?: string,
     dueDateEnd?: string,
   ) {
-    // Método mejorado usando query builder optimizado según pasted content
     const queryBuilder = this.creditRepository
       .createQueryBuilder('c')
       .leftJoin('c.client', 'cl')
       .select('c.credit_id', 'credit_id')
       .addSelect('cl.client_id', 'client_id')
-      .addSelect('cl.name', 'client_name')
-      .addSelect('c.total_amount - COALESCE(c.amount_paid, 0)', 'balance')
+      .addSelect("CONCAT_WS(' ', cl.first_name, cl.last_name)", 'client_name')
+      .addSelect('c.credit_amount - COALESCE(c.amount_paid, 0)', 'balance')
       .addSelect('c.due_date', 'due_date')
-      .addSelect('c.total_amount', 'total_amount')
+      .addSelect('c.credit_amount', 'total_amount')
       .addSelect('c.amount_paid', 'amount_paid')
       .where('c.due_date::date BETWEEN :dueDateStart::date AND :dueDateEnd::date', {
         dueDateStart: dueDateStart || '1900-01-01',
         dueDateEnd: dueDateEnd || '2099-12-31',
       })
-      .andWhere('(c.total_amount - COALESCE(c.amount_paid, 0)) > 0');
+      .andWhere('(c.credit_amount - COALESCE(c.amount_paid, 0)) > 0');
 
     if (clientId) {
       queryBuilder.andWhere('cl.client_id = :clientId', { clientId });
     }
-
     if (status === 'overdue') {
       queryBuilder.andWhere('c.due_date < NOW()');
     }
@@ -653,24 +646,17 @@ export class ReportsService {
     queryBuilder.orderBy('c.due_date', 'ASC');
 
     const rawResults = await queryBuilder.getRawMany();
-
     const totalOutstanding = rawResults.reduce((sum, credit) =>
       sum + Number(credit.balance || 0), 0
     );
-
     const partialPayments = rawResults.reduce((sum, credit) =>
       sum + Number(credit.amount_paid || 0), 0
     );
 
-    // Aging de cuentas mejorado
     const now = new Date();
     const agingData = {
-      '0-30': 0,
-      '31-60': 0,
-      '61-90': 0,
-      '90+': 0,
+      '0-30': 0, '31-60': 0, '61-90': 0, '90+': 0,
     };
-
     const creditsDetails = rawResults.map(credit => {
       const dueDate = new Date(credit.due_date);
       const daysOverdue = Math.floor((now.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24));
@@ -715,68 +701,37 @@ export class ReportsService {
     clientId?: number,
     paymentMethod?: string,
   ) {
-    // Implementación mejorada según pasted content
-    // Nota: Este método requiere una entidad Payment relacionada con Credit
-    // Por ahora implementamos una estructura básica que puede ser expandida
-
-    // Si existe una tabla de pagos de créditos, usar este query:
-    /*
-    const queryBuilder = this.paymentRepository
-      .createQueryBuilder('pay')
-      .leftJoin('pay.credit', 'c')
-      .leftJoin('pay.paymentMethod', 'pm')
-      .leftJoin('c.client', 'cl')
-      .select("date_trunc('day', pay.paid_at AT TIME ZONE 'America/Lima')", 'bucket')
-      .addSelect('pm.method_name', 'payment_method')
-      .addSelect('SUM(pay.amount)', 'total')
-      .addSelect('cl.client_id', 'client_id')
-      .addSelect('cl.name', 'client_name')
-      .where('pay.paid_at::date BETWEEN :startDate::date AND :endDate::date', {
-        startDate,
-        endDate,
+    const queryBuilder = this.saleRepository.manager
+      .createQueryBuilder()
+      .select("p.payment_id", "payment_id")
+      .addSelect("p.amount", "amount")
+      .addSelect("p.payment_timestamp", "payment_date")
+      .addSelect("pm.name", "payment_method")
+      .addSelect("c.client_id", "client_id")
+      .addSelect("CONCAT_WS(' ', cl.first_name, cl.last_name)", 'client_name')
+      .from("payments", "p")
+      .leftJoin("payment_methods", "pm", "p.payment_method_id = pm.payment_method_id")
+      .leftJoin("credits", "c", "p.credit_id = c.credit_id")
+      .leftJoin("clients", "cl", "c.client_id = cl.client_id")
+      // Corregido: Usa fechas por defecto si los parámetros están vacíos
+      .where('p.payment_timestamp::date BETWEEN :startDate::date AND :endDate::date', {
+        startDate: startDate || '1900-01-01',
+        endDate: endDate || '2099-12-31',
       })
-      .groupBy('bucket')
-      .addGroupBy('pm.method_name')
-      .addGroupBy('cl.client_id')
-      .addGroupBy('cl.name')
-      .orderBy('bucket', 'ASC');
+      .andWhere('p.credit_id IS NOT NULL');
 
     if (clientId) {
-      queryBuilder.andWhere('cl.client_id = :clientId', { clientId });
+      queryBuilder.andWhere('c.client_id = :clientId', { clientId });
     }
     if (paymentMethod) {
-      queryBuilder.andWhere('pm.method_name = :method', { method: paymentMethod });
+      queryBuilder.andWhere('pm.name = :method', { method: paymentMethod });
     }
 
     const rawResults = await queryBuilder.getRawMany();
-    */
-
-    // Implementación básica usando los créditos existentes
-    const queryBuilder = this.creditRepository
-      .createQueryBuilder('c')
-      .leftJoin('c.client', 'cl')
-      .select('c.credit_id', 'credit_id')
-      .addSelect('cl.client_id', 'client_id')
-      .addSelect('cl.name', 'client_name')
-      .addSelect('c.amount_paid', 'amount_paid')
-      .addSelect('c.updated_at', 'payment_date')
-      .where('c.updated_at::date BETWEEN :startDate::date AND :endDate::date', {
-        startDate,
-        endDate,
-      })
-      .andWhere('c.amount_paid > 0');
-
-    if (clientId) {
-      queryBuilder.andWhere('cl.client_id = :clientId', { clientId });
-    }
-
-    const rawResults = await queryBuilder.getRawMany();
-
     const totalCollections = rawResults.reduce((sum, payment) =>
-      sum + Number(payment.amount_paid || 0), 0
+      sum + Number(payment.amount || 0), 0
     );
 
-    // Datos de cobros por día
     const collectionTrends = {};
     rawResults.forEach(payment => {
       const date = payment.payment_date ?
@@ -786,19 +741,20 @@ export class ReportsService {
       if (!collectionTrends[date]) {
         collectionTrends[date] = 0;
       }
-      collectionTrends[date] += Number(payment.amount_paid || 0);
+      collectionTrends[date] += Number(payment.amount || 0);
     });
 
     return {
       totalCollections,
-      collectionEfficiency: totalCollections > 0 ? 100 : 0, // Simplificado
+      collectionEfficiency: totalCollections > 0 ? 100 : 0,
       collectionTrends,
       collectionsDetails: rawResults.map(row => ({
-        credit_id: row.credit_id,
+        payment_id: row.payment_id,
         client_id: row.client_id,
         client_name: row.client_name,
-        amount_paid: Number(row.amount_paid || 0),
+        amount: Number(row.amount || 0),
         payment_date: row.payment_date,
+        payment_method: row.payment_method,
       })),
       collectionsCount: rawResults.length,
     };
@@ -809,8 +765,6 @@ export class ReportsService {
   async exportSalesToExcel(reportData: any, filters: any): Promise<Buffer> {
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet('Reporte de Ventas');
-
-    // Configurar encabezados
     worksheet.columns = [
       { header: 'Fecha', key: 'fecha', width: 15 },
       { header: 'Tipo', key: 'tipo', width: 12 },
@@ -818,13 +772,9 @@ export class ReportsService {
       { header: 'Cantidad', key: 'cantidad', width: 12 },
       { header: 'Monto', key: 'monto', width: 15 },
     ];
-
-    // Agregar información del filtro
     worksheet.addRow(['Reporte de Ventas']);
     worksheet.addRow([`Período: ${filters.startDate} - ${filters.endDate}`]);
     worksheet.addRow([]);
-
-    // Agregar resumen
     worksheet.addRow(['RESUMEN']);
     worksheet.addRow(['Total de Ventas:', reportData.totalSales || 0]);
     worksheet.addRow(['Cantidad Total:', reportData.totalQuantity || 0]);
@@ -832,43 +782,33 @@ export class ReportsService {
     worksheet.addRow(['Número de Ventas:', reportData.salesCount || 0]);
     worksheet.addRow([]);
 
-    // Agregar datos de timeline si existen
     if (reportData.timelineData) {
       worksheet.addRow(['VENTAS POR DÍA']);
       worksheet.addRow(['Fecha', 'Ventas', 'Cantidad']);
-
       Object.entries(reportData.timelineData).forEach(([date, data]: [string, any]) => {
         worksheet.addRow([date, data.sales, data.quantity]);
       });
       worksheet.addRow([]);
     }
-
-    // Agregar datos por producto si existen
     if (reportData.salesByProduct) {
       worksheet.addRow(['VENTAS POR PRODUCTO']);
       worksheet.addRow(['Producto', 'Cantidad', 'Monto']);
-
       Object.entries(reportData.salesByProduct).forEach(([product, data]: [string, any]) => {
         worksheet.addRow([product, data.quantity, data.amount]);
       });
       worksheet.addRow([]);
     }
-
-    // Agregar datos por método de pago si existen
     if (reportData.salesByPaymentMethod) {
       worksheet.addRow(['VENTAS POR MÉTODO DE PAGO']);
       worksheet.addRow(['Método de Pago', 'Monto']);
-
       Object.entries(reportData.salesByPaymentMethod).forEach(([method, amount]: [string, any]) => {
         worksheet.addRow([method, amount]);
       });
     }
 
-    // Aplicar estilos
     worksheet.getRow(1).font = { bold: true, size: 16 };
     worksheet.getRow(4).font = { bold: true };
 
-    // Generar buffer
     const buffer = await workbook.xlsx.writeBuffer();
     return Buffer.from(buffer);
   }
@@ -882,15 +822,12 @@ export class ReportsService {
   }): Promise<Buffer> {
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Reporte');
-
-    // Título
     ws.mergeCells('A1', String.fromCharCode(64 + opts.columns.length) + '1');
     ws.getCell('A1').value = opts.title;
     ws.getCell('A1').font = { bold: true, size: 14 };
     ws.getRow(2).values = opts.columns.map(c => c.header);
     ws.getRow(2).font = { bold: true };
 
-    // Filas
     const rows = opts.rows.map(r => {
       const obj: Record<string, any> = {};
       for (const c of opts.columns) {
@@ -904,7 +841,6 @@ export class ReportsService {
 
     ws.addRows(rows);
 
-    // Estilos y formatos
     opts.columns.forEach((c, i) => {
       const col = ws.getColumn(i + 1);
       if (c.width) col.width = c.width;
@@ -923,7 +859,6 @@ export class ReportsService {
     columns: ColumnDef[];
     landscape?: boolean;
   }): Promise<Buffer> {
-    // Fuentes mínimas (usa Roboto embebido o cualquiera en tu proyecto)
     const fonts = {
       Roboto: {
         normal: Buffer.from([]),
@@ -933,12 +868,9 @@ export class ReportsService {
       },
     };
     const printer = new PdfPrinter(fonts);
-
     const body: TableCell[][] = [];
-    // Encabezados
     body.push(opts.columns.map(c => ({ text: c.header, bold: true })) as TableCell[]);
 
-    // Filas
     for (const r of opts.rows) {
       const row: TableCell[] = [];
       for (const c of opts.columns) {
